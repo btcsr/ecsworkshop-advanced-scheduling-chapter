@@ -1,26 +1,13 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Parameters:
-  # KeyName:
-  #   Type: AWS::EC2::KeyPair::KeyName
-  #   Description: Name of an existing EC2 KeyPair to enable SSH access to the ECS instances.
-  # VpcId:
-  #   Type: AWS::EC2::VPC::Id
-  #   Description: Select a VPC that allows instances access to the Internet.
-  # SubnetId:
-  #   Type: List<AWS::EC2::Subnet::Id>
-  #   Description: Select at two subnets in your selected VPC.
   VPCStackParameter:
     Type: String
     Description: Name of the VPC Stack
     Default: 'ecsworkshop-vpc'
   DesiredCapacity:
     Type: Number
-    Default: '1'
+    Default: '0'
     Description: Number of instances to launch in your ECS cluster.
-  # ServiceDesiredCount:
-  #   Type: Number
-  #   Default: 0
-  #   Description: ECS Service Desired count. 
   MaxSize:
     Type: Number
     Default: '1'
@@ -260,16 +247,7 @@ Resources:
       CapacityProviders:
         - !Ref ArmECSCapacityProvider
         - !Ref GpuECSCapacityProvider
-      DefaultCapacityProviderStrategy:
-        - Base: 0
-          Weight: 0
-          CapacityProvider: !Ref ArmECSCapacityProvider
-        - Base: 0
-          Weight: 1
-          CapacityProvider: !Ref GpuECSCapacityProvider
 
-
-#Lambda Function to describe ASG and get ASG ARN for Capacity Provier.
   GetASGArn:
     Type: 'AWS::Lambda::Function'
     Properties:
