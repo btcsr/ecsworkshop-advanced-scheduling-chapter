@@ -1,0 +1,431 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  # KeyName:
+  #   Type: AWS::EC2::KeyPair::KeyName
+  #   Description: Name of an existing EC2 KeyPair to enable SSH access to the ECS instances.
+  # VpcId:
+  #   Type: AWS::EC2::VPC::Id
+  #   Description: Select a VPC that allows instances access to the Internet.
+  # SubnetId:
+  #   Type: List<AWS::EC2::Subnet::Id>
+  #   Description: Select at two subnets in your selected VPC.
+  VPCStackParameter:
+    Type: String
+    Description: Name of the VPC Stack
+    Default: 'ecsworkshop-vpc'
+  DesiredCapacity:
+    Type: Number
+    Default: '1'
+    Description: Number of instances to launch in your ECS cluster.
+  # ServiceDesiredCount:
+  #   Type: Number
+  #   Default: 0
+  #   Description: ECS Service Desired count. 
+  MaxSize:
+    Type: Number
+    Default: '1'
+    Description: Maximum number of instances that can be launched in your ECS cluster.
+  ArmInstanceType:
+    Description: Arm-based EC2 instance type
+    Type: String
+    Default: t4g.micro
+    AllowedValues:
+      - t4g.micro
+      - t4g.small
+      - t4g.medium
+      - t4g.large
+      - t4g.xlarge
+      - t4g.2xlarge
+      - a1.medium
+      - a1.large
+      - a1.xlarge
+      - a1.2xlarge
+      - a1.4xlarge
+      - a1.metal 
+  GpuInstanceType:
+    Description: Arm-based EC2 instance type
+    Type: String
+    Default: p2.xlarge
+    AllowedValues:
+      - p2.xlarge
+      - p2.8xlarge
+      - p2.16xlarge
+      - p3.2xlarge
+      - p3.8xlarge
+      - p3.16xlarge
+      - p3dn.24xlarge
+      - p4d.24xlarge
+      - g3s.xlarge
+      - g3.4xlarge
+      - g3.8xlarge
+      - g3.16xlarge
+      - g4dn.xlarge
+      - g4dn.2xlarge
+      - g4dn.4xlarge
+      - g4dn.8xlarge
+      - g4dn.12xlarge
+      - g4dn.16xlarge
+    ConstraintDescription: Please choose a valid instance type.
+
+  ArmLatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ecs/optimized-ami/amazon-linux-2/arm64/recommended/image_id'
+    Description: 'Latest Amazon ECS-optimized Amazon Linux 2 (arm64) AMI'
+
+  GPULatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ecs/optimized-ami/amazon-linux-2/gpu/recommended/image_id'
+    Description: 'Latest Amazon ECS GPU-optimized AMI'
+
+Resources:
+# ECS Cluster for ARM64 and GPU based container instances. 
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+
+# Task Definition for ARM64 base instance type. PlacementConstraints properties is defining to select cpu-arhitecture type arm64.
+  Arm64taskdefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Join ['', [!Ref 'AWS::StackName', -arm64]]
+      PlacementConstraints: 
+        - Type: memberOf
+          Expression: 'attribute:ecs.cpu-architecture == arm64'
+      ContainerDefinitions:
+      - Name: simple-arm64-app
+        Cpu: 10
+        Command:
+          - sh
+          - '-c'
+          - uname -a && sleep 300
+        Essential: true
+        Image: public.ecr.aws/amazonlinux/amazonlinux:latest
+        Memory: 200
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref 'CloudwatchLogsGroup'
+            awslogs-region: !Ref 'AWS::Region'
+            awslogs-stream-prefix: ecs-arm64-demo-app
+
+# ASG launch configuration to select specific instance type and register instance to ECS Cluster. 
+  ArmASGLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !Ref ArmLatestAmiId
+      # SecurityGroups: [!Ref 'EcsSecurityGroup']
+      SecurityGroups: !Split
+        - ','
+        - Fn::ImportValue: !Sub "${VPCStackParameter}-SecurityGroups"
+      InstanceType: !Ref 'ArmInstanceType'
+      IamInstanceProfile: !Ref 'EC2InstanceProfile'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ArmECSAutoScalingGroup --region ${AWS::Region}
+
+ # ASG configuration to launche instance type using ARM64 launche configuration.  
+  ArmECSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: "ArmECSAutoScalingGroup"
+      NewInstancesProtectedFromScaleIn: true
+      VPCZoneIdentifier: !Split
+        - ','
+        - Fn::ImportValue: !Sub "${VPCStackParameter}-PrivateSubnetIds"
+      LaunchConfigurationName: !Ref 'ArmASGLaunchConfiguration'
+      MinSize: '0'
+      MaxSize: !Ref 'MaxSize'
+      DesiredCapacity: '0'
+      DesiredCapacity: !Ref 'DesiredCapacity'
+      Tags:
+        - Key: Name
+          Value: !Sub 'ARM64-${ECSCluster}'
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref 'DesiredCapacity'
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: true
+
+#Capacity Provider configuration to create CapacityProvider for ARM ASG. Capacity Provider needs ARM ASG Arn, 
+# so CloudFormation customer resource ARMClusterResource will make describe API call to ARM ASG to get the desired value. 
+  ArmECSCapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+        Name: 'ArmECSCapacityProvider'
+        AutoScalingGroupProvider:
+            AutoScalingGroupArn: !Select [0, !GetAtt ARMCustomResource.Data ]
+            ManagedScaling:
+                MaximumScalingStepSize: 10
+                MinimumScalingStepSize: 1
+                Status: ENABLED
+                TargetCapacity: 100
+            ManagedTerminationProtection: ENABLED
+
+# Task Definition for GPU base instance type. PlacementConstraints properties is defining to select instance-type which support GPUInstance type.
+  Gputaskdefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Join ['', [!Ref 'AWS::StackName', -gpu]]
+      PlacementConstraints: 
+        - Type: memberOf
+          Expression: !Sub 'attribute:ecs.instance-type == ${GpuInstanceType}'
+      ContainerDefinitions:
+      - Name: simple-gpu-app
+        Cpu: 100
+        Essential: true
+        Image: nvidia/cuda:11.0-base
+        Memory: 80
+        ResourceRequirements:
+          - Type: GPU
+            Value: '1'
+        Command:
+          - sh
+          - '-c'
+          - nvidia-smi && sleep 300
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref 'CloudwatchLogsGroup'
+            awslogs-region: !Ref 'AWS::Region'
+            awslogs-stream-prefix: ecs-gpu-demo-app
+
+# ASG launch configuration to select specific instance type and register instance to ECS Cluster. 
+  GpuASGLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !Ref GPULatestAmiId
+      # SecurityGroups: [!Ref 'EcsSecurityGroup']
+      SecurityGroups: !Split
+        - ','
+        - Fn::ImportValue: !Sub "${VPCStackParameter}-SecurityGroups"
+      InstanceType: !Ref 'GpuInstanceType'
+      IamInstanceProfile: !Ref 'EC2InstanceProfile'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource GpuECSAutoScalingGroup --region ${AWS::Region}
+
+# ASG configuration to launche instance type using ARM64 launche configuration.  
+  GpuECSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      ArmECSAutoScalingGroup: "GpuECSAutoScalingGroup"
+      NewInstancesProtectedFromScaleIn: true
+      VPCZoneIdentifier: !Split
+        - ','
+        - Fn::ImportValue: !Sub "${VPCStackParameter}-PrivateSubnetIds"
+      LaunchConfigurationName: !Ref 'GpuASGLaunchConfiguration'
+      MinSize: '0'
+      MaxSize: !Ref 'MaxSize'
+      DesiredCapacity: !Ref 'DesiredCapacity'
+      Tags:
+        - Key: Name
+          Value: !Sub 'GPU-${ECSCluster}'
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref 'DesiredCapacity'
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: true
+
+#Capacity Provider configuration to create CapacityProvider for GPU ASG. Capacity Provider needs GPU ASG Arn, 
+# so CloudFormation customer resource ARMClusterResource will make describe API call to GPU ASG to get the desired value. 
+  GpuECSCapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+        Name: 'GpuECSCapacityProvider'
+        AutoScalingGroupProvider:
+            AutoScalingGroupArn: !Select [1, !GetAtt ARMCustomResource.Data ]
+            ManagedScaling:
+                MaximumScalingStepSize: 10
+                MinimumScalingStepSize: 1
+                Status: ENABLED
+                TargetCapacity: 100
+            ManagedTerminationProtection: ENABLED
+
+#Associate ECS Cluster Capacity Provider with both the ARM and CPU capacity provider. 
+  ClusterCPAssociation:
+    Type: "AWS::ECS::ClusterCapacityProviderAssociations"
+    Properties:
+      Cluster: !Ref ECSCluster
+      CapacityProviders:
+        - !Ref ArmECSCapacityProvider
+        - !Ref GpuECSCapacityProvider
+      DefaultCapacityProviderStrategy:
+        - Base: 0
+          Weight: 0
+          CapacityProvider: !Ref ArmECSCapacityProvider
+        - Base: 0
+          Weight: 1
+          CapacityProvider: !Ref GpuECSCapacityProvider
+
+
+#Lambda Function to describe ASG and get ASG ARN for Capacity Provier.
+  GetASGArn:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import cfnresponse
+          import boto3
+          client = boto3.client('autoscaling')
+          def handler(event, context):
+              responseData = {}
+              Data = []
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                    asgName = event['ResourceProperties']['ASGName']
+                    for asg in range(len(asgName)):
+                      response = client.describe_auto_scaling_groups(AutoScalingGroupNames=[asgName[asg]])
+                      asgArn = response['AutoScalingGroups'][0]['AutoScalingGroupARN']
+                      Data.append(asgArn)
+                    responseData['Data'] = Data
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+                  elif event['RequestType'] == 'Delete':
+                    responseData['Data'] = event['RequestType']
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+                  else:
+                    responseData['Data'] = event['RequestType']
+                    cfnresponse.send(event, context, cfnresponse.FAILED, responseData, "CustomResourcePhysicalID")
+              except:
+                  responseData['Data'] = 'EXCEPTION'
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData, "CustomResourcePhysicalID")
+      Runtime: python3.7
+
+#Custom Resource to trigger Lambda Function to describe ASG's to get ARN for Capacity Provider  creation
+  ARMCustomResource:
+    Type: 'Custom::ARMLambda'
+    Properties:
+      ServiceToken: !GetAtt GetASGArn.Arn
+      ASGName:
+        - !Ref ArmECSAutoScalingGroup
+        - !Ref GpuECSAutoScalingGroup
+
+#Lambda Function Execution IAM Role. 
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+      - PolicyName: Lambda-CloudWatchLogs
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Action:
+                - 'autoscaling:Describe*'
+              Resource: '*'
+            - Effect: Allow
+              Action: ['logs:CreateLogGroup', 'logs:PutLogEvents', 'logs:CreateLogStream']
+              Resource:
+                - "arn:aws:logs:*:*:*"
+
+# ECS Service IAM Role
+  ECSServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: ['elasticloadbalancing:DeregisterInstancesFromLoadBalancer', 'elasticloadbalancing:DeregisterTargets',
+              'elasticloadbalancing:Describe*', 'elasticloadbalancing:RegisterInstancesWithLoadBalancer',
+              'elasticloadbalancing:RegisterTargets', 'ec2:Describe*', 'ec2:AuthorizeSecurityGroupIngress']
+            Resource: '*'
+
+# ECS Container Instance Profile IAM Role. 
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ec2.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: ['ecs:CreateCluster', 'ecs:DeregisterContainerInstance', 'ecs:DiscoverPollEndpoint',
+              'ecs:Poll', 'ecs:RegisterContainerInstance', 'ecs:StartTelemetrySession',
+              'ecs:Submit*', 'logs:CreateLogStream', 'logs:PutLogEvents']
+            Resource: '*'
+#AutoScaling Group IAM Role.
+  AutoscalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [application-autoscaling.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: service-autoscaling
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: ['application-autoscaling:*', 'cloudwatch:DescribeAlarms', 'cloudwatch:PutMetricAlarm',
+              'ecs:DescribeServices', 'ecs:UpdateService']
+            Resource: '*'
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [!Ref 'EC2Role']
+
+#CloudWatch Log group for ECS. 
+  CloudwatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['-', [ECSLogGroup, !Ref 'AWS::StackName']]
+      RetentionInDays: 14
+
+Outputs:
+  ecscluster:
+    Value: !Ref 'ECSCluster'
+    Description: 'ECS Cluster name'
+  Armtaskdef:
+    Value: !Ref 'Arm64taskdefinition'
+    Description: 'Arm64 task definition'
+  Gputaskdef:
+    Value: !Ref 'Gputaskdefinition'
+    Description: 'GPU task definition'
+  ArmECSCapacityProvider:
+    Value: !Ref ArmECSCapacityProvider
+    Description: 'Arm Capacity Provider'
+  GpuECSCapacityProvider:
+    Value: !Ref 'GpuECSCapacityProvider'
+    Description: 'GPU Capacity Provicder'
